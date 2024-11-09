@@ -3,10 +3,17 @@ import random
 import argparse
 import json
 import torch
+import torch.nn.functional as FU
 from PIL import Image
 from torchvision import transforms
 import torchvision.transforms.functional as F
 from glob import glob
+
+import logging
+logging.basicConfig(filename='report.log', level=logging.DEBUG)
+print = logging.debug
+
+SD_TURBO_PATH = "/mnt/netdisk/niuchenyu/sd-turbo"
 
 
 def parse_args_paired_training(input_args=None):
@@ -25,6 +32,9 @@ def parse_args_paired_training(input_args=None):
     parser.add_argument("--lambda_lpips", default=5, type=float)
     parser.add_argument("--lambda_l2", default=1.0, type=float)
     parser.add_argument("--lambda_clipsim", default=5.0, type=float)
+    parser.add_argument("--lambda_maskl2", default=1.0, type=float)
+    parser.add_argument("--lambda_maskbce", default=2.0, type=float)
+    parser.add_argument("--lambda_maskdice", default=0.8, type=float)
 
     # dataset options
     parser.add_argument("--dataset_folder", required=True, type=str)
@@ -237,23 +247,25 @@ class PairedDataset(torch.utils.data.Dataset):
         if split == "train":
             self.input_folder = os.path.join(dataset_folder, "train_A")
             self.output_folder = os.path.join(dataset_folder, "train_B")
-            captions = os.path.join(dataset_folder, "train_prompts.json")
+            self.captions_folder = os.path.join(dataset_folder, "train_prompts")
         elif split == "test":
             self.input_folder = os.path.join(dataset_folder, "test_A")
             self.output_folder = os.path.join(dataset_folder, "test_B")
-            captions = os.path.join(dataset_folder, "test_prompts.json")
-        with open(captions, "r") as f:
-            self.captions = json.load(f)
-        self.img_names = list(self.captions.keys())
+            self.captions_folder = os.path.join(dataset_folder, "test_prompts")
+        self.img_names = list(os.listdir(self.input_folder))
         self.T = build_transform(image_prep)
         self.tokenizer = tokenizer
+
+        assert(len(os.listdir(self.input_folder)) == len(os.listdir(self.output_folder)))
+        self.dataset_length = len(os.listdir(self.input_folder))
+        self.src_folder = "/mnt/netdisk/niuchenyu/src"
 
     def __len__(self):
         """
         Returns:
         int: The total number of items in the dataset.
         """
-        return len(self.captions)
+        return self.dataset_length
 
     def __getitem__(self, idx):
         """
@@ -285,7 +297,15 @@ class PairedDataset(torch.utils.data.Dataset):
         img_name = self.img_names[idx]
         input_img = Image.open(os.path.join(self.input_folder, img_name))
         output_img = Image.open(os.path.join(self.output_folder, img_name))
-        caption = self.captions[img_name]
+        caption_json = os.path.join(self.captions_folder, img_name.replace('.jpg', '.json'))
+        with open(caption_json, "r") as f:
+            data = json.load(f)
+            caption = data.get('caption')
+            randomseed = data.get('random_mask')
+
+        random_mask = Image.open(os.path.join(self.src_folder, f"{randomseed // 100}/{randomseed:03d}/random_mask.png")).convert("L")
+        random_mask_t = F.to_tensor(random_mask)
+        random_mask_t[random_mask_t > 0] = 1
 
         # input images scaled to 0,1
         img_t = self.T(input_img)
@@ -294,6 +314,8 @@ class PairedDataset(torch.utils.data.Dataset):
         output_t = self.T(output_img)
         output_t = F.to_tensor(output_t)
         output_t = F.normalize(output_t, mean=[0.5], std=[0.5])
+
+        combined_mask = random_mask_t
 
         input_ids = self.tokenizer(
             caption, max_length=self.tokenizer.model_max_length,
@@ -305,6 +327,7 @@ class PairedDataset(torch.utils.data.Dataset):
             "conditioning_pixel_values": img_t,
             "caption": caption,
             "input_ids": input_ids,
+            "mask_values": combined_mask, 
         }
 
 
@@ -407,3 +430,63 @@ class UnpairedDataset(torch.utils.data.Dataset):
             "input_ids_src": self.input_ids_src,
             "input_ids_tgt": self.input_ids_tgt,
         }
+
+
+def balanced_binary_entropy_loss(pred, gt, reduction="mean"):
+    '''
+    compute balanced binary entropy loss for two tensors in shape [B, C, H, W]
+    gt tensor must take values of 0 or 1
+    '''
+
+    pos = torch.eq(gt, 1).float()
+    neg = torch.eq(gt, 0).float()
+    num_pos = torch.sum(pos, dim=(-1, -2))
+    num_neg = torch.sum(neg, dim=(-1, -2))
+    alpha_pos = (num_neg / (num_pos + num_neg)).unsqueeze(-1).unsqueeze(-1)
+    alpha_neg = 1.5 * (1 - alpha_pos)
+
+    weight = alpha_pos * pos + alpha_neg * neg
+
+    return FU.binary_cross_entropy(pred, gt, weight, reduction=reduction)
+
+
+def dice_loss(pred, gt):
+    eps = 1e-8
+    pred = pred.contiguous().view(pred.shape[0], -1)
+    gt = gt.contiguous().view(gt.shape[0], -1)
+
+    inter = 2 * torch.sum(torch.mul(pred, gt), dim=1)
+    union = torch.sum(pred, dim=1) + torch.sum(gt, dim=1) + eps
+
+    loss = 1 - inter / union
+
+    return loss
+
+
+def mask_list_loss(pred, gt, bce, dice):
+    '''
+    pred: list of predicted mask in different shapes: 16, 32, 64
+    gt: ground truth mask in size 512
+    bce: float, weight for bce loss if not None
+    dice: float, weight for dice loss if not None
+    assume batch size is 1
+    '''
+
+    gt_256 = FU.interpolate(gt, scale_factor=0.5, mode='bilinear')
+    gt_128 = FU.interpolate(gt, scale_factor=0.25, mode='bilinear')
+    gt_64 = FU.interpolate(gt, scale_factor=0.125, mode='bilinear')
+    gt_32 = FU.interpolate(gt, scale_factor=0.0625, mode='bilinear')
+    gt_16 = FU.interpolate(gt, scale_factor=0.03125, mode='bilinear')
+    gt_list = [gt_16, gt_32, gt_64, gt_128, gt_256, gt]
+
+    loss_bce, loss_dice = 0, 0
+    for i, t in enumerate(pred):
+        assert(t.shape == gt_list[i].shape)
+        loss_bce += balanced_binary_entropy_loss(t, gt_list[i])
+        loss_dice += dice_loss(t, gt_list[i])
+    
+    if bce is not None:
+        return loss_bce * bce + loss_dice * dice
+    else:
+        return loss_bce + loss_dice
+

@@ -22,6 +22,7 @@ from cleanfid.fid import get_folder_features, build_feature_extractor, fid_from_
 
 from pix2pix_turbo import Pix2Pix_Turbo
 from my_utils.training_utils import parse_args_paired_training, PairedDataset
+from my_utils.training_utils import SD_TURBO_PATH, mask_list_loss
 
 
 def main(args):
@@ -45,7 +46,7 @@ def main(args):
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
         os.makedirs(os.path.join(args.output_dir, "eval"), exist_ok=True)
 
-    if args.pretrained_model_name_or_path == "stabilityai/sd-turbo":
+    if args.pretrained_model_name_or_path == SD_TURBO_PATH:
         net_pix2pix = Pix2Pix_Turbo(lora_rank_unet=args.lora_rank_unet, lora_rank_vae=args.lora_rank_vae)
         net_pix2pix.set_train()
 
@@ -86,6 +87,12 @@ def main(args):
             assert _p.requires_grad
             layers_to_opt.append(_p)
     layers_to_opt += list(net_pix2pix.unet.conv_in.parameters())
+    layers_to_opt += list(net_pix2pix.conv16.parameters()) + \
+        list(net_pix2pix.conv32.parameters()) + \
+        list(net_pix2pix.conv64.parameters()) + \
+        list(net_pix2pix.unet_layer_0_1.parameters()) + \
+        list(net_pix2pix.unet_layer_1_2.parameters()) + \
+        list(net_pix2pix.unet_layer_2_3.parameters())
     for n, _p in net_pix2pix.vae.named_parameters():
         if "lora" in n and "vae_skip" in n:
             assert _p.requires_grad
@@ -93,7 +100,14 @@ def main(args):
     layers_to_opt = layers_to_opt + list(net_pix2pix.vae.decoder.skip_conv_1.parameters()) + \
         list(net_pix2pix.vae.decoder.skip_conv_2.parameters()) + \
         list(net_pix2pix.vae.decoder.skip_conv_3.parameters()) + \
-        list(net_pix2pix.vae.decoder.skip_conv_4.parameters())
+        list(net_pix2pix.vae.decoder.skip_conv_4.parameters()) + \
+        list(net_pix2pix.vae.decoder.conv128.parameters()) + \
+        list(net_pix2pix.vae.decoder.conv256.parameters()) + \
+        list(net_pix2pix.vae.decoder.conv512.parameters()) + \
+        list(net_pix2pix.vae.decoder.conv_0.parameters()) + \
+        list(net_pix2pix.vae.decoder.conv_1.parameters()) + \
+        list(net_pix2pix.vae.decoder.conv_2.parameters()) + \
+        list(net_pix2pix.vae.decoder.conv_3.parameters())
 
     optimizer = torch.optim.AdamW(layers_to_opt, lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.adam_weight_decay,
@@ -170,13 +184,15 @@ def main(args):
             with accelerator.accumulate(*l_acc):
                 x_src = batch["conditioning_pixel_values"]
                 x_tgt = batch["output_pixel_values"]
+                mask_tgt = batch["mask_values"]
                 B, C, H, W = x_src.shape
                 # forward pass
-                x_tgt_pred = net_pix2pix(x_src, prompt_tokens=batch["input_ids"], deterministic=True)
+                x_tgt_pred, mask_tgt_pred_list = net_pix2pix(x_src, prompt_tokens=batch["input_ids"], deterministic=True)
                 # Reconstruction loss
                 loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean") * args.lambda_l2
+                loss_mask = mask_list_loss(mask_tgt_pred_list, mask_tgt, args.lambda_maskbce, args.lambda_maskdice)
                 loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean() * args.lambda_lpips
-                loss = loss_l2 + loss_lpips
+                loss = loss_l2 + loss_lpips + loss_mask
                 # CLIP similarity loss
                 if args.lambda_clipsim > 0:
                     x_tgt_pred_renorm = t_clip_renorm(x_tgt_pred * 0.5 + 0.5)
@@ -195,7 +211,7 @@ def main(args):
                 """
                 Generator loss: fool the discriminator
                 """
-                x_tgt_pred = net_pix2pix(x_src, prompt_tokens=batch["input_ids"], deterministic=True)
+                x_tgt_pred, _ = net_pix2pix(x_src, prompt_tokens=batch["input_ids"], deterministic=True)
                 lossG = net_disc(x_tgt_pred, for_G=True).mean() * args.lambda_gan
                 accelerator.backward(lossG)
                 if accelerator.sync_gradients:
@@ -235,6 +251,7 @@ def main(args):
                     logs["lossG"] = lossG.detach().item()
                     logs["lossD"] = lossD.detach().item()
                     logs["loss_l2"] = loss_l2.detach().item()
+                    logs["loss_mask"] = loss_mask.detach().item()
                     logs["loss_lpips"] = loss_lpips.detach().item()
                     if args.lambda_clipsim > 0:
                         logs["loss_clipsim"] = loss_clipsim.detach().item()
@@ -246,6 +263,13 @@ def main(args):
                             "train/source": [wandb.Image(x_src[idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)],
                             "train/target": [wandb.Image(x_tgt[idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)],
                             "train/model_output": [wandb.Image(x_tgt_pred[idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)],
+                            "train/random": [wandb.Image(mask_tgt[idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)], 
+                            "train/random_predict_16": [wandb.Image(mask_tgt_pred_list[0][idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)], 
+                            "train/random_predict_32": [wandb.Image(mask_tgt_pred_list[1][idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)], 
+                            "train/random_predict_64": [wandb.Image(mask_tgt_pred_list[2][idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)], 
+                            "train/random_predict_128": [wandb.Image(mask_tgt_pred_list[3][idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)], 
+                            "train/random_predict_256": [wandb.Image(mask_tgt_pred_list[4][idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)], 
+                            "train/random_predict_512": [wandb.Image(mask_tgt_pred_list[5][idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)], 
                         }
                         for k in log_dict:
                             logs[k] = log_dict[k]
@@ -257,7 +281,7 @@ def main(args):
 
                     # compute validation set FID, L2, LPIPS, CLIP-SIM
                     if global_step % args.eval_freq == 1:
-                        l_l2, l_lpips, l_clipsim = [], [], []
+                        l_l2, l_mask, l_lpips, l_clipsim = [], [], [], []
                         if args.track_val_fid:
                             os.makedirs(os.path.join(args.output_dir, "eval", f"fid_{global_step}"), exist_ok=True)
                         for step, batch_val in enumerate(dl_val):
@@ -265,13 +289,15 @@ def main(args):
                                 break
                             x_src = batch_val["conditioning_pixel_values"].cuda()
                             x_tgt = batch_val["output_pixel_values"].cuda()
+                            mask_tgt = batch_val["mask_values"].cuda()
                             B, C, H, W = x_src.shape
                             assert B == 1, "Use batch size 1 for eval."
                             with torch.no_grad():
                                 # forward pass
-                                x_tgt_pred = accelerator.unwrap_model(net_pix2pix)(x_src, prompt_tokens=batch_val["input_ids"].cuda(), deterministic=True)
+                                x_tgt_pred, mask_tgt_pred_list = accelerator.unwrap_model(net_pix2pix)(x_src, prompt_tokens=batch_val["input_ids"].cuda(), deterministic=True)
                                 # compute the reconstruction losses
                                 loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean")
+                                loss_mask = mask_list_loss(mask_tgt_pred_list, mask_tgt, None, None)
                                 loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean()
                                 # compute clip similarity loss
                                 x_tgt_pred_renorm = t_clip_renorm(x_tgt_pred * 0.5 + 0.5)
@@ -281,6 +307,7 @@ def main(args):
                                 clipsim = clipsim.mean()
 
                                 l_l2.append(loss_l2.item())
+                                l_mask.append(loss_mask.item())
                                 l_lpips.append(loss_lpips.item())
                                 l_clipsim.append(clipsim.item())
                             # save output images to file for FID evaluation
@@ -295,6 +322,7 @@ def main(args):
                             fid_score = fid_from_feats(ref_stats, curr_stats)
                             logs["val/clean_fid"] = fid_score
                         logs["val/l2"] = np.mean(l_l2)
+                        logs["val/mask"] = np.mean(l_mask)
                         logs["val/lpips"] = np.mean(l_lpips)
                         logs["val/clipsim"] = np.mean(l_clipsim)
                         gc.collect()

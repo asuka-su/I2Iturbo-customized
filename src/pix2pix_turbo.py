@@ -4,6 +4,7 @@ import sys
 import copy
 from tqdm import tqdm
 import torch
+import torch.nn.functional as F
 from transformers import AutoTokenizer, CLIPTextModel
 from diffusers import AutoencoderKL, UNet2DConditionModel
 from diffusers.utils.peft_utils import set_weights_and_activate_adapters
@@ -11,6 +12,12 @@ from peft import LoraConfig
 p = "src/"
 sys.path.append(p)
 from model import make_1step_sched, my_vae_encoder_fwd, my_vae_decoder_fwd
+from model import myUNet2DConditionModel, my_vae_decode, _my_decode
+from my_utils.training_utils import SD_TURBO_PATH
+
+import logging
+logging.basicConfig(filename='report.log', level=logging.DEBUG)
+print = logging.debug
 
 
 class TwinConv(torch.nn.Module):
@@ -29,20 +36,40 @@ class TwinConv(torch.nn.Module):
 class Pix2Pix_Turbo(torch.nn.Module):
     def __init__(self, pretrained_name=None, pretrained_path=None, ckpt_folder="checkpoints", lora_rank_unet=8, lora_rank_vae=4):
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained("stabilityai/sd-turbo", subfolder="tokenizer")
-        self.text_encoder = CLIPTextModel.from_pretrained("stabilityai/sd-turbo", subfolder="text_encoder").cuda()
+        self.tokenizer = AutoTokenizer.from_pretrained(SD_TURBO_PATH, subfolder="tokenizer")
+        self.text_encoder = CLIPTextModel.from_pretrained(SD_TURBO_PATH, subfolder="text_encoder").cuda()
         self.sched = make_1step_sched()
 
-        vae = AutoencoderKL.from_pretrained("stabilityai/sd-turbo", subfolder="vae")
+        vae = AutoencoderKL.from_pretrained(SD_TURBO_PATH, subfolder="vae")
         vae.encoder.forward = my_vae_encoder_fwd.__get__(vae.encoder, vae.encoder.__class__)
         vae.decoder.forward = my_vae_decoder_fwd.__get__(vae.decoder, vae.decoder.__class__)
+        vae.decode = my_vae_decode.__get__(vae, vae.__class__)
+        vae._decode = _my_decode.__get__(vae, vae.__class__)
         # add the skip connection convs
-        vae.decoder.skip_conv_1 = torch.nn.Conv2d(512, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
-        vae.decoder.skip_conv_2 = torch.nn.Conv2d(256, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
-        vae.decoder.skip_conv_3 = torch.nn.Conv2d(128, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
-        vae.decoder.skip_conv_4 = torch.nn.Conv2d(128, 256, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
+        vae.decoder.skip_conv_1 = torch.nn.Conv2d(1024, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
+        vae.decoder.skip_conv_2 = torch.nn.Conv2d(512, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
+        vae.decoder.skip_conv_3 = torch.nn.Conv2d(256, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
+        vae.decoder.skip_conv_4 = torch.nn.Conv2d(256, 256, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
         vae.decoder.ignore_skip = False
-        unet = UNet2DConditionModel.from_pretrained("stabilityai/sd-turbo", subfolder="unet")
+        
+        vae.decoder.conv128 = torch.nn.Conv2d(512, 1, kernel_size=3, padding=1).cuda()
+        vae.decoder.conv256 = torch.nn.Conv2d(512, 1, kernel_size=3, padding=1).cuda()
+        vae.decoder.conv512 = torch.nn.Conv2d(128, 1, kernel_size=3, padding=1).cuda()
+
+        vae.decoder.conv_0 = torch.nn.Conv2d(320, 512, kernel_size=3, padding=1).cuda()
+        vae.decoder.conv_1 = torch.nn.Conv2d(512, 256, kernel_size=3, padding=1).cuda()
+        vae.decoder.conv_2 = torch.nn.Conv2d(512, 128, kernel_size=3, padding=1).cuda()
+        vae.decoder.conv_3 = torch.nn.Conv2d(512, 128, kernel_size=3, padding=1).cuda()
+
+        unet = myUNet2DConditionModel.from_pretrained(SD_TURBO_PATH, subfolder="unet")
+        self.tanh = torch.nn.Tanh()
+        self.sigmoid = torch.nn.Sigmoid()
+        self.unet_layer_0_1 = torch.nn.Conv2d(1280, 1280, kernel_size=3, padding=1).cuda()
+        self.unet_layer_1_2 = torch.nn.Conv2d(1280, 640, kernel_size=3, padding=1).cuda()
+        self.unet_layer_2_3 = torch.nn.Conv2d(640, 320, kernel_size=3, padding=1).cuda()
+        self.conv16 = torch.nn.Conv2d(1280, 1, kernel_size=3, padding=1).cuda()
+        self.conv32 = torch.nn.Conv2d(1280, 1, kernel_size=3, padding=1).cuda()
+        self.conv64 = torch.nn.Conv2d(320, 1, kernel_size=3, padding=1).cuda()
 
         if pretrained_name == "edge_to_image":
             url = "https://www.cs.cmu.edu/~img2img-turbo/models/edge_to_image_loras.pkl"
@@ -128,6 +155,20 @@ class Pix2Pix_Turbo(torch.nn.Module):
                 _sd_unet[k] = sd["state_dict_unet"][k]
             unet.load_state_dict(_sd_unet)
 
+            self.conv16.load_state_dict(sd['unet_conv_state_dict']['conv16'])
+            self.conv32.load_state_dict(sd['unet_conv_state_dict']['conv32'])
+            self.conv64.load_state_dict(sd['unet_conv_state_dict']['conv64'])
+            self.unet_layer_0_1.load_state_dict(sd['unet_conv_state_dict']['unet_layer_0_1'])
+            self.unet_layer_1_2.load_state_dict(sd['unet_conv_state_dict']['unet_layer_1_2'])
+            self.unet_layer_2_3.load_state_dict(sd['unet_conv_state_dict']['unet_layer_2_3'])
+            vae.decoder.conv128.load_state_dict(sd['vae_conv_state_dict']['conv128'])
+            vae.decoder.conv256.load_state_dict(sd['vae_conv_state_dict']['conv256'])
+            vae.decoder.conv512.load_state_dict(sd['vae_conv_state_dict']['conv512'])
+            vae.decoder.conv_0.load_state_dict(sd['vae_conv_state_dict']['conv_0'])
+            vae.decoder.conv_1.load_state_dict(sd['vae_conv_state_dict']['conv_1'])
+            vae.decoder.conv_2.load_state_dict(sd['vae_conv_state_dict']['conv_2'])
+            vae.decoder.conv_3.load_state_dict(sd['vae_conv_state_dict']['conv_3'])
+
         elif pretrained_name is None and pretrained_path is None:
             print("Initializing model with random weights")
             torch.nn.init.constant_(vae.decoder.skip_conv_1.weight, 1e-5)
@@ -182,6 +223,19 @@ class Pix2Pix_Turbo(torch.nn.Module):
         self.vae.decoder.skip_conv_2.requires_grad_(True)
         self.vae.decoder.skip_conv_3.requires_grad_(True)
         self.vae.decoder.skip_conv_4.requires_grad_(True)
+        self.unet_layer_0_1.requires_grad_(True)
+        self.unet_layer_1_2.requires_grad_(True)
+        self.unet_layer_2_3.requires_grad_(True)
+        self.conv16.requires_grad_(True)
+        self.conv32.requires_grad_(True)
+        self.conv64.requires_grad_(True)
+        self.vae.decoder.conv128.requires_grad_(True)
+        self.vae.decoder.conv256.requires_grad_(True)
+        self.vae.decoder.conv512.requires_grad_(True)
+        self.vae.decoder.conv_0.requires_grad_(True)
+        self.vae.decoder.conv_1.requires_grad_(True)
+        self.vae.decoder.conv_2.requires_grad_(True)
+        self.vae.decoder.conv_3.requires_grad_(True)
 
     def forward(self, c_t, prompt=None, prompt_tokens=None, deterministic=True, r=1.0, noise_map=None):
         # either the prompt or the prompt_tokens should be provided
@@ -194,36 +248,57 @@ class Pix2Pix_Turbo(torch.nn.Module):
             caption_enc = self.text_encoder(caption_tokens)[0]
         else:
             caption_enc = self.text_encoder(prompt_tokens)[0]
+
         if deterministic:
             encoded_control = self.vae.encode(c_t).latent_dist.sample() * self.vae.config.scaling_factor
-            model_pred = self.unet(encoded_control, self.timesteps, encoder_hidden_states=caption_enc,).sample
+            model_pred, up_ft = self.unet(encoded_control, self.timesteps, encoder_hidden_states=caption_enc,)
+            model_pred = model_pred.sample
+
+            temp1 = self.tanh(self.unet_layer_0_1(F.interpolate(up_ft[0], scale_factor=2, mode='bilinear'))) + up_ft[1]
+            temp2 = self.tanh(self.unet_layer_1_2(F.interpolate(temp1, scale_factor=2, mode='bilinear'))) + up_ft[2]
+            temp3 = self.tanh(self.unet_layer_2_3(temp2)) + up_ft[3]
+            mask_16 = self.sigmoid(self.conv16(up_ft[0]))
+            mask_32 = self.sigmoid(self.conv32(temp1))
+            mask_64 = self.sigmoid(self.conv64(temp3))
+            mask_list = [mask_16, mask_32, mask_64]
+
             x_denoised = self.sched.step(model_pred, self.timesteps, encoded_control, return_dict=True).prev_sample
             x_denoised = x_denoised.to(model_pred.dtype)
             self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
-            output_image = (self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample).clamp(-1, 1)
+            decode_result = self.vae.decode(x_denoised / self.vae.config.scaling_factor, temp3)
+            output_image = decode_result[0].clamp(-1, 1)
+            mask_list = mask_list + decode_result[1]
+
         else:
-            # scale the lora weights based on the r value
-            self.unet.set_adapters(["default"], weights=[r])
-            set_weights_and_activate_adapters(self.vae, ["vae_skip"], [r])
-            encoded_control = self.vae.encode(c_t).latent_dist.sample() * self.vae.config.scaling_factor
-            # combine the input and noise
-            unet_input = encoded_control * r + noise_map * (1 - r)
-            self.unet.conv_in.r = r
-            unet_output = self.unet(unet_input, self.timesteps, encoder_hidden_states=caption_enc,).sample
-            self.unet.conv_in.r = None
-            x_denoised = self.sched.step(unet_output, self.timesteps, unet_input, return_dict=True).prev_sample
-            x_denoised = x_denoised.to(unet_output.dtype)
-            self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
-            self.vae.decoder.gamma = r
-            output_image = (self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample).clamp(-1, 1)
-        return output_image
+            print("Not used...")
+
+        return output_image, mask_list
 
     def save_model(self, outf):
         sd = {}
+        unet_conv_state_dict = {
+            'conv16': self.conv16.state_dict(), 
+            'conv32': self.conv32.state_dict(), 
+            'conv64': self.conv64.state_dict(), 
+            'unet_layer_0_1': self.unet_layer_0_1.state_dict(), 
+            'unet_layer_1_2': self.unet_layer_1_2.state_dict(), 
+            'unet_layer_2_3': self.unet_layer_2_3.state_dict(), 
+        }
+        vae_conv_state_dict = {
+            'conv128': self.vae.decoder.conv128.state_dict(), 
+            'conv256': self.vae.decoder.conv256.state_dict(), 
+            'conv512': self.vae.decoder.conv512.state_dict(), 
+            'conv_0': self.vae.decoder.conv_0.state_dict(), 
+            'conv_1': self.vae.decoder.conv_1.state_dict(), 
+            'conv_2': self.vae.decoder.conv_2.state_dict(), 
+            'conv_3': self.vae.decoder.conv_3.state_dict(), 
+        }
         sd["unet_lora_target_modules"] = self.target_modules_unet
         sd["vae_lora_target_modules"] = self.target_modules_vae
         sd["rank_unet"] = self.lora_rank_unet
         sd["rank_vae"] = self.lora_rank_vae
         sd["state_dict_unet"] = {k: v for k, v in self.unet.state_dict().items() if "lora" in k or "conv_in" in k}
         sd["state_dict_vae"] = {k: v for k, v in self.vae.state_dict().items() if "lora" in k or "skip" in k}
+        sd["unet_conv_state_dict"] = unet_conv_state_dict
+        sd["vae_conv_state_dict"] = vae_conv_state_dict
         torch.save(sd, outf)
