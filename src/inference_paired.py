@@ -67,9 +67,13 @@ if __name__ == "__main__":
             c_t = F.to_tensor(input_image).unsqueeze(0).cuda()
             if args.use_fp16:
                 c_t = c_t.half()
-            output_image = model(c_t, args.prompt)
+            output_image, predicted_mask_list = model(c_t, args.prompt)
 
         output_pil = transforms.ToPILImage()(output_image[0].cpu() * 0.5 + 0.5)
+        for i, t in enumerate(predicted_mask_list):
+            predicted_mask_list[i] = transforms.ToPILImage()(predicted_mask_list[i][0,:].cpu())
 
     # save the output image
     output_pil.save(os.path.join(args.output_dir, bname))
+    for i, t in enumerate(predicted_mask_list):
+        t.save(os.path.join(args.output_dir, f"random_mask_{2 ** (i + 4)}.png"))
