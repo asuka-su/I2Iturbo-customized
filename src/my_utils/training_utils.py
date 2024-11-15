@@ -298,14 +298,17 @@ class PairedDataset(torch.utils.data.Dataset):
         input_img = Image.open(os.path.join(self.input_folder, img_name))
         output_img = Image.open(os.path.join(self.output_folder, img_name))
         caption_json = os.path.join(self.captions_folder, img_name.replace('.jpg', '.json'))
-        with open(caption_json, "r") as f:
-            data = json.load(f)
-            caption = data.get('caption')
-            randomseed = data.get('random_mask')
-
-        random_mask = Image.open(os.path.join(self.src_folder, f"{randomseed // 100}/{randomseed:03d}/random_mask.png")).convert("L")
-        random_mask_t = F.to_tensor(random_mask)
-        random_mask_t[random_mask_t > 0] = 1
+        
+        try:
+            with open(caption_json, "r") as f:
+                data = json.load(f)
+                caption = data.get('caption')
+                crackseed = data.get('crack')
+        except:
+            return self.__getitem__(idx + 1)
+        
+        crack_mask = Image.open(os.path.join(self.src_folder, f"{crackseed // 100}/{crackseed:03d}/final_mask_b.png")).convert("L")
+        crack_mask_t = F.to_tensor(crack_mask)
 
         # input images scaled to 0,1
         img_t = self.T(input_img)
@@ -315,7 +318,7 @@ class PairedDataset(torch.utils.data.Dataset):
         output_t = F.to_tensor(output_t)
         output_t = F.normalize(output_t, mean=[0.5], std=[0.5])
 
-        combined_mask = random_mask_t
+        combined_mask = crack_mask_t
 
         input_ids = self.tokenizer(
             caption, max_length=self.tokenizer.model_max_length,
@@ -456,7 +459,7 @@ def dice_loss(pred, gt):
     gt = gt.contiguous().view(gt.shape[0], -1)
 
     inter = 2 * torch.sum(torch.mul(pred, gt), dim=1)
-    union = torch.sum(pred, dim=1) + torch.sum(gt, dim=1) + eps
+    union = torch.sum(pred * pred, dim=1) + torch.sum(gt * gt, dim=1) + eps
 
     loss = 1 - inter / union
 
