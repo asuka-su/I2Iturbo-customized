@@ -302,8 +302,10 @@ class PairedDataset(torch.utils.data.Dataset):
             data = json.load(f)
             caption = data.get('caption')
             randomseed = data.get('random_mask')
+            randomtype = data.get('random_mask_type')
 
-        random_mask = Image.open(os.path.join(self.src_folder, f"{randomseed // 100}/{randomseed:03d}/random_mask.png")).convert("L")
+        random_mask_type_list = ['random_mask.png', 'random_walk.png', 'random_walk_dilate.png']
+        random_mask = Image.open(os.path.join(self.src_folder, f"{randomseed // 100}/{randomseed:03d}/" + random_mask_type_list[randomtype])).convert("L")
         random_mask_t = F.to_tensor(random_mask)
         random_mask_t[random_mask_t > 0] = 1
 
