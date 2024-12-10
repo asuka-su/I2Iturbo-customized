@@ -10,19 +10,20 @@ tokenizers
 torch>=2.0.1
 
 torchaudio>=2.0.2
-torchdata==0.6.1
+torchdata==0.8.0
 torchmetrics>=1.0.1
 torchvision>=0.15.2
 
 tqdm>=4.65.0
 transformers==4.35.2
 urllib3<1.27,>=1.25.4
-xformers>=0.0.20
+xformers>=0.0.27
 streamlit-keyup==0.2.0
 lpips
 clean-fid
-peft
+peft==0.13.2
 dominate
+huggingface-hub==0.24.1
 diffusers==0.25.1
 gradio==3.43.1
 

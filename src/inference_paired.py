@@ -7,6 +7,9 @@ from torchvision import transforms
 import torchvision.transforms.functional as F
 from pix2pix_turbo import Pix2Pix_Turbo
 from image_prep import canny_from_pil
+from sam2.build_sam import build_sam2
+from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -34,12 +37,25 @@ if __name__ == "__main__":
     if args.use_fp16:
         model.half()
 
+    # initialize SAM2 model
+    device = torch.device("cuda")
+    sam2_checkpoint = "/mnt/netdisk/niuchenyu/sam2/checkpoints/sam2.1_hiera_large.pt"
+    model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+    sam2_model = build_sam2(model_cfg, sam2_checkpoint, device=device, apply_postprocessing=False)
+    predictor = SAM2ImagePredictor(sam2_model)
+
     # make sure that the input image is a multiple of 8
     input_image = Image.open(args.input_image).convert('RGB')
     new_width = input_image.width - input_image.width % 8
     new_height = input_image.height - input_image.height % 8
     input_image = input_image.resize((new_width, new_height), Image.LANCZOS)
     bname = os.path.basename(args.input_image)
+
+    predictor.set_image(input_image)
+    c_t_embed = {
+        "image_embed": predictor._features["image_embed"][0].cuda(), 
+        "high_res_feats": [t[0].cuda() for t in predictor._features["high_res_feats"]], 
+    }
 
     # translate the image
     with torch.no_grad():
@@ -67,7 +83,7 @@ if __name__ == "__main__":
             c_t = F.to_tensor(input_image).unsqueeze(0).cuda()
             if args.use_fp16:
                 c_t = c_t.half()
-            output_image, predicted_mask_list = model(c_t, args.prompt)
+            output_image, predicted_mask_list = model(c_t, c_t_embed, args.prompt)
 
         output_pil = transforms.ToPILImage()(output_image[0].cpu() * 0.5 + 0.5)
         for i, t in enumerate(predicted_mask_list):

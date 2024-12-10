@@ -8,6 +8,10 @@ from PIL import Image
 from torchvision import transforms
 import torchvision.transforms.functional as F
 from glob import glob
+from sam2.build_sam import build_sam2
+from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+from sam2.sam2_image_predictor import SAM2ImagePredictor
+
 
 import logging
 logging.basicConfig(filename='report.log', level=logging.DEBUG)
@@ -260,6 +264,13 @@ class PairedDataset(torch.utils.data.Dataset):
         self.dataset_length = len(os.listdir(self.input_folder))
         self.src_folder = "/mnt/netdisk/niuchenyu/src"
 
+        # SAM2 model should be loaded and operated on another GPU in case of memory explosion
+        device = torch.device("cuda")
+        sam2_checkpoint = "/mnt/netdisk/niuchenyu/sam2/checkpoints/sam2.1_hiera_large.pt"
+        model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+        sam2_model = build_sam2(model_cfg, sam2_checkpoint, device=device, apply_postprocessing=False)
+        self.predictor = SAM2ImagePredictor(sam2_model)
+
     def __len__(self):
         """
         Returns:
@@ -309,6 +320,8 @@ class PairedDataset(torch.utils.data.Dataset):
         random_mask_t = F.to_tensor(random_mask)
         random_mask_t[random_mask_t > 0] = 1
 
+        self.predictor.set_image(input_img)
+
         # input images scaled to 0,1
         img_t = self.T(input_img)
         img_t = F.to_tensor(img_t)
@@ -330,6 +343,10 @@ class PairedDataset(torch.utils.data.Dataset):
             "caption": caption,
             "input_ids": input_ids,
             "mask_values": combined_mask, 
+            "SAM2_embed": {
+                "image_embed": self.predictor._features["image_embed"][0], 
+                "high_res_feats": [t[0] for t in self.predictor._features["high_res_feats"]], 
+            }, 
         }
 
 

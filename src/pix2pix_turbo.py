@@ -12,7 +12,7 @@ from peft import LoraConfig
 p = "src/"
 sys.path.append(p)
 from model import make_1step_sched, my_vae_encoder_fwd, my_vae_decoder_fwd
-from model import myUNet2DConditionModel, my_vae_decode, _my_decode
+from model import myUNet2DConditionModel, my_vae_decode, _my_decode, my_vae_encode
 from my_utils.training_utils import SD_TURBO_PATH
 
 import logging
@@ -44,6 +44,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
         vae.encoder.forward = my_vae_encoder_fwd.__get__(vae.encoder, vae.encoder.__class__)
         vae.decoder.forward = my_vae_decoder_fwd.__get__(vae.decoder, vae.decoder.__class__)
         vae.decode = my_vae_decode.__get__(vae, vae.__class__)
+        vae.encode = my_vae_encode.__get__(vae, vae.__class__)
         vae._decode = _my_decode.__get__(vae, vae.__class__)
         # add the skip connection convs
         vae.decoder.skip_conv_1 = torch.nn.Conv2d(1024, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
@@ -60,6 +61,10 @@ class Pix2Pix_Turbo(torch.nn.Module):
         vae.decoder.conv_1 = torch.nn.Conv2d(512, 256, kernel_size=3, padding=1).cuda()
         vae.decoder.conv_2 = torch.nn.Conv2d(512, 128, kernel_size=3, padding=1).cuda()
         vae.decoder.conv_3 = torch.nn.Conv2d(512, 128, kernel_size=3, padding=1).cuda()
+
+        vae.encoder.conv256 = torch.nn.Conv2d(32, 128, kernel_size=3, padding=1).cuda()
+        vae.encoder.conv128 = torch.nn.Conv2d(64, 256, kernel_size=3, padding=1).cuda()
+        vae.encoder.conv64 = torch.nn.Conv2d(256, 512, kernel_size=3, padding=1).cuda()
 
         unet = myUNet2DConditionModel.from_pretrained(SD_TURBO_PATH, subfolder="unet")
         self.tanh = torch.nn.Tanh()
@@ -168,6 +173,9 @@ class Pix2Pix_Turbo(torch.nn.Module):
             vae.decoder.conv_1.load_state_dict(sd['vae_conv_state_dict']['conv_1'])
             vae.decoder.conv_2.load_state_dict(sd['vae_conv_state_dict']['conv_2'])
             vae.decoder.conv_3.load_state_dict(sd['vae_conv_state_dict']['conv_3'])
+            vae.encoder.conv256.load_state_dict(sd['vae_conv_state_dict']['conv256_e'])
+            vae.encoder.conv128.load_state_dict(sd['vae_conv_state_dict']['conv128_e'])
+            vae.encoder.conv64.load_state_dict(sd['vae_conv_state_dict']['conv64_e'])
 
         elif pretrained_name is None and pretrained_path is None:
             print("Initializing model with random weights")
@@ -175,6 +183,9 @@ class Pix2Pix_Turbo(torch.nn.Module):
             torch.nn.init.constant_(vae.decoder.skip_conv_2.weight, 1e-5)
             torch.nn.init.constant_(vae.decoder.skip_conv_3.weight, 1e-5)
             torch.nn.init.constant_(vae.decoder.skip_conv_4.weight, 1e-5)
+            torch.nn.init.constant_(vae.encoder.conv256.weight, 1e-5)
+            torch.nn.init.constant_(vae.encoder.conv128.weight, 1e-5)
+            torch.nn.init.constant_(vae.encoder.conv64.weight, 1e-5)
             target_modules_vae = ["conv1", "conv2", "conv_in", "conv_shortcut", "conv", "conv_out",
                 "skip_conv_1", "skip_conv_2", "skip_conv_3", "skip_conv_4",
                 "to_k", "to_q", "to_v", "to_out.0",
@@ -236,8 +247,11 @@ class Pix2Pix_Turbo(torch.nn.Module):
         self.vae.decoder.conv_1.requires_grad_(True)
         self.vae.decoder.conv_2.requires_grad_(True)
         self.vae.decoder.conv_3.requires_grad_(True)
+        self.vae.encoder.conv256.requires_grad_(True)
+        self.vae.encoder.conv128.requires_grad_(True)
+        self.vae.encoder.conv64.requires_grad_(True)
 
-    def forward(self, c_t, prompt=None, prompt_tokens=None, deterministic=True, r=1.0, noise_map=None):
+    def forward(self, c_t, c_t_embed, prompt=None, prompt_tokens=None, deterministic=True, r=1.0, noise_map=None):
         # either the prompt or the prompt_tokens should be provided
         assert (prompt is None) != (prompt_tokens is None), "Either prompt or prompt_tokens should be provided"
 
@@ -250,7 +264,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
             caption_enc = self.text_encoder(prompt_tokens)[0]
 
         if deterministic:
-            encoded_control = self.vae.encode(c_t).latent_dist.sample() * self.vae.config.scaling_factor
+            encoded_control = self.vae.encode(c_t, c_t_embed).latent_dist.sample() * self.vae.config.scaling_factor
             model_pred, up_ft = self.unet(encoded_control, self.timesteps, encoder_hidden_states=caption_enc,)
             model_pred = model_pred.sample
 
@@ -292,6 +306,9 @@ class Pix2Pix_Turbo(torch.nn.Module):
             'conv_1': self.vae.decoder.conv_1.state_dict(), 
             'conv_2': self.vae.decoder.conv_2.state_dict(), 
             'conv_3': self.vae.decoder.conv_3.state_dict(), 
+            'conv256_e': self.vae.encoder.conv256.state_dict(), 
+            'conv128_e': self.vae.encoder.conv128.state_dict(), 
+            'conv64_e': self.vae.encoder.conv64.state_dict(), 
         }
         sd["unet_lora_target_modules"] = self.target_modules_unet
         sd["vae_lora_target_modules"] = self.target_modules_vae

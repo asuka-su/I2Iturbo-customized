@@ -5,6 +5,8 @@ import torch.nn.functional as F
 
 from diffusers import DDPMScheduler
 from diffusers.models.unet_2d_condition import UNet2DConditionModel, UNet2DConditionOutput
+from diffusers.models.modeling_outputs import AutoencoderKLOutput
+from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.utils import USE_PEFT_BACKEND, scale_lora_layers, unscale_lora_layers, deprecate
 from diffusers.utils.accelerate_utils import apply_forward_hook
 from tqdm import tqdm
@@ -24,11 +26,36 @@ def make_1step_sched():
     return noise_scheduler_1step
 
 
-def my_vae_encoder_fwd(self, sample):
+@apply_forward_hook
+def my_vae_encode(self, x, x_embed, return_dict=True):
+    if self.use_tiling and (x.shape[-1] > self.tile_sample_min_size or x.shape[-2] > self.tile_sample_min_size):
+        print("not implemented!")
+        exit()
+    
+    if self.use_slicing and x.shape[0] > 1:
+        print("not implemented!")
+        exit()
+    else:
+        h = self.encoder(x, x_embed)
+    
+    moments = self.quant_conv(h)
+    posterior = DiagonalGaussianDistribution(moments)
+
+    if not return_dict:
+        return (posterior, )
+
+    return AutoencoderKLOutput(latent_dist=posterior)
+
+def my_vae_encoder_fwd(self, sample, sample_embed):
     sample = self.conv_in(sample)
     l_blocks = []
     # down
-    for down_block in self.down_blocks:
+    my_add_convs = [None, self.conv256, self.conv128, self.conv64]
+    sample_sam2 = [None, sample_embed["high_res_feats"][0], sample_embed["high_res_feats"][1], sample_embed["image_embed"]]
+    for idx, down_block in enumerate(self.down_blocks):
+        if my_add_convs[idx] is not None:
+            sam2_temp = my_add_convs[idx](sample_sam2[idx])
+            sample += sam2_temp
         l_blocks.append(sample)
         sample = down_block(sample)
     # middle
@@ -36,6 +63,7 @@ def my_vae_encoder_fwd(self, sample):
     sample = self.conv_norm_out(sample)
     sample = self.conv_act(sample)
     sample = self.conv_out(sample)
+    print(f"encoder final shape {sample.shape}")
     self.current_down_blocks = l_blocks
     return sample
 

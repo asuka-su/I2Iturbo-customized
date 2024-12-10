@@ -24,6 +24,10 @@ from pix2pix_turbo import Pix2Pix_Turbo
 from my_utils.training_utils import parse_args_paired_training, PairedDataset
 from my_utils.training_utils import SD_TURBO_PATH, mask_list_loss
 
+import logging
+logging.basicConfig(filename='report.log', level=logging.DEBUG)
+print = logging.debug
+
 
 def main(args):
     accelerator = Accelerator(
@@ -107,7 +111,10 @@ def main(args):
         list(net_pix2pix.vae.decoder.conv_0.parameters()) + \
         list(net_pix2pix.vae.decoder.conv_1.parameters()) + \
         list(net_pix2pix.vae.decoder.conv_2.parameters()) + \
-        list(net_pix2pix.vae.decoder.conv_3.parameters())
+        list(net_pix2pix.vae.decoder.conv_3.parameters()) + \
+        list(net_pix2pix.vae.encoder.conv256.parameters()) + \
+        list(net_pix2pix.vae.encoder.conv128.parameters()) + \
+        list(net_pix2pix.vae.encoder.conv64.parameters()) 
 
     optimizer = torch.optim.AdamW(layers_to_opt, lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.adam_weight_decay,
@@ -183,11 +190,12 @@ def main(args):
             l_acc = [net_pix2pix, net_disc]
             with accelerator.accumulate(*l_acc):
                 x_src = batch["conditioning_pixel_values"]
+                x_src_sam2 = batch["SAM2_embed"]
                 x_tgt = batch["output_pixel_values"]
                 mask_tgt = batch["mask_values"]
                 B, C, H, W = x_src.shape
                 # forward pass
-                x_tgt_pred, mask_tgt_pred_list = net_pix2pix(x_src, prompt_tokens=batch["input_ids"], deterministic=True)
+                x_tgt_pred, mask_tgt_pred_list = net_pix2pix(x_src, x_src_sam2, prompt_tokens=batch["input_ids"], deterministic=True)
                 # Reconstruction loss
                 loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean") * args.lambda_l2
                 loss_mask = mask_list_loss(mask_tgt_pred_list, mask_tgt, args.lambda_maskbce, args.lambda_maskdice)
@@ -211,7 +219,7 @@ def main(args):
                 """
                 Generator loss: fool the discriminator
                 """
-                x_tgt_pred, _ = net_pix2pix(x_src, prompt_tokens=batch["input_ids"], deterministic=True)
+                x_tgt_pred, _ = net_pix2pix(x_src, x_src_sam2, prompt_tokens=batch["input_ids"], deterministic=True)
                 lossG = net_disc(x_tgt_pred, for_G=True).mean() * args.lambda_gan
                 accelerator.backward(lossG)
                 if accelerator.sync_gradients:
@@ -288,13 +296,18 @@ def main(args):
                             if step >= args.num_samples_eval:
                                 break
                             x_src = batch_val["conditioning_pixel_values"].cuda()
+                            # hardcode for cuda
+                            x_src_sam2 = {
+                                "image_embed": batch_val["SAM2_embed"]["image_embed"].cuda(), 
+                                "high_res_feats": [t.cuda() for t in batch_val["SAM2_embed"]["high_res_feats"]], 
+                            }
                             x_tgt = batch_val["output_pixel_values"].cuda()
                             mask_tgt = batch_val["mask_values"].cuda()
                             B, C, H, W = x_src.shape
                             assert B == 1, "Use batch size 1 for eval."
                             with torch.no_grad():
                                 # forward pass
-                                x_tgt_pred, mask_tgt_pred_list = accelerator.unwrap_model(net_pix2pix)(x_src, prompt_tokens=batch_val["input_ids"].cuda(), deterministic=True)
+                                x_tgt_pred, mask_tgt_pred_list = accelerator.unwrap_model(net_pix2pix)(x_src, x_src_sam2, prompt_tokens=batch_val["input_ids"].cuda(), deterministic=True)
                                 # compute the reconstruction losses
                                 loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean")
                                 loss_mask = mask_list_loss(mask_tgt_pred_list, mask_tgt, None, None)
